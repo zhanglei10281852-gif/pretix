@@ -132,6 +132,29 @@ class WebHook(models.Model):
             l.action_type for l in self.listeners.all()
         ]
 
+    def save(self, *args, **kwargs):
+        update_fields = kwargs.get('update_fields')
+        check_enabled = self.pk is not None and not self.enabled and (
+            update_fields is None or 'enabled' in update_fields
+        )
+        if check_enabled:
+            was_enabled = type(self).objects.filter(pk=self.pk).values_list('enabled', flat=True).first()
+        else:
+            was_enabled = None
+        super().save(*args, **kwargs)
+        if was_enabled:
+            # Explicitly terminate all deliveries that have not reached a final state. Their
+            # frozen target is gone for good, so they must neither be retried nor stay around
+            # in a waiting/running state.
+            WebHookDelivery.objects.filter(
+                webhook=self,
+                state__in=(WebHookDelivery.STATE_WAITING, WebHookDelivery.STATE_RUNNING),
+            ).update(
+                state=WebHookDelivery.STATE_DISABLED,
+                scheduled_at=None,
+                locked_at=None,
+            )
+
 
 class WebHookEventListener(models.Model):
     webhook = models.ForeignKey('WebHook', on_delete=models.CASCADE, related_name='listeners')
@@ -141,8 +164,63 @@ class WebHookEventListener(models.Model):
         ordering = ("action_type",)
 
 
+class WebHookDelivery(models.Model):
+    """
+    A single, stable delivery of one notification to one webhook.
+
+    The delivery is created when the notification is first queued and from that point on keeps
+    its own identity as well as frozen snapshots of the target URL, event type and JSON request
+    body. All delivery attempts (immediate retries, database-delayed retries, periodic scans and
+    an administrator's "retry now") continue the very same delivery, while changes to the
+    webhook configuration or to the related business objects only affect *new* deliveries.
+    """
+    STATE_WAITING = 'waiting'
+    STATE_RUNNING = 'running'
+    STATE_SUCCESS = 'success'
+    STATE_GIVEN_UP = 'given_up'
+    STATE_DISABLED = 'disabled'
+
+    STATE_CHOICES = (
+        (STATE_WAITING, _("Waiting for an attempt")),
+        (STATE_RUNNING, _("Attempt in progress")),
+        (STATE_SUCCESS, _("Successfully delivered")),
+        (STATE_GIVEN_UP, _("Given up")),
+        (STATE_DISABLED, _("Terminated because the endpoint was disabled")),
+    )
+    TERMINAL_STATES = frozenset((STATE_SUCCESS, STATE_GIVEN_UP, STATE_DISABLED))
+    ACTIVE_STATES = frozenset((STATE_WAITING, STATE_RUNNING))
+
+    id = models.BigAutoField(primary_key=True)
+    webhook = models.ForeignKey('WebHook', on_delete=models.CASCADE, related_name='deliveries')
+    logentry = models.ForeignKey('pretixbase.LogEntry', on_delete=models.CASCADE,
+                                 related_name='webhook_deliveries')
+    action_type = models.CharField(max_length=255)
+    target_url = models.URLField(max_length=1024)
+    payload = models.TextField()
+    state = models.CharField(max_length=16, choices=STATE_CHOICES, default=STATE_WAITING)
+    retry_count = models.PositiveIntegerField(default=0)
+    retry_not_before = models.DateTimeField(default=now)
+    # Set whenever a celery task has been published for a waiting delivery, so that concurrent
+    # periodic scans do not publish a second active copy. Cleared again if publishing fails.
+    scheduled_at = models.DateTimeField(null=True, blank=True)
+    # Set when an attempt starts; used to detect workers that crashed (or tasks that were lost)
+    # mid-attempt and to reclaim the delivery.
+    locked_at = models.DateTimeField(null=True, blank=True)
+    created = models.DateTimeField(auto_now_add=True)
+    updated = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ('id',)
+        unique_together = (('webhook', 'logentry'),)
+        indexes = [
+            models.Index(fields=['state', 'retry_not_before']),
+        ]
+
+
 class WebHookCall(models.Model):
     webhook = models.ForeignKey('WebHook', on_delete=models.CASCADE, related_name='calls')
+    delivery = models.ForeignKey('WebHookDelivery', on_delete=models.SET_NULL, null=True, blank=True,
+                                 related_name='calls')
     datetime = models.DateTimeField(auto_now_add=True)
     target_url = models.URLField(max_length=1024)
     action_type = models.CharField(max_length=255)
@@ -155,18 +233,6 @@ class WebHookCall(models.Model):
 
     class Meta:
         ordering = ("-datetime",)
-
-
-class WebHookCallRetry(models.Model):
-    id = models.BigAutoField(primary_key=True)
-    webhook = models.ForeignKey('WebHook', on_delete=models.CASCADE, related_name='retries')
-    logentry = models.ForeignKey('pretixbase.LogEntry', on_delete=models.CASCADE, related_name='webhook_retries')
-    retry_not_before = models.DateTimeField()
-    retry_count = models.PositiveIntegerField(default=0)
-    action_type = models.CharField(max_length=255)
-
-    class Meta:
-        unique_together = (('webhook', 'logentry'),)
 
 
 class ApiCall(models.Model):

@@ -100,6 +100,14 @@ not do any harm.
 There is only one exception: If status code ``410 Gone`` is returned, we will assume the
 endpoint does not exist any more and automatically disable the webhook.
 
+Every notification receives a stable delivery identity when it is first queued. The target
+address, event type and the JSON request body of that delivery are frozen at that moment and
+are not affected by later changes to the webhook configuration (such as changing the target
+URL or subscription scope) or by later changes of the related order, ticket or other business
+object. All retries, including those triggered manually, continue this exact delivery.
+Configuration changes therefore only apply to notifications created after the change.
+Disabling a webhook or choosing to stop all retries explicitly terminates pending deliveries.
+
 .. note:: If you use a self-hosted version of pretix (i.e. not our SaaS offering at pretix.eu) and you did not
           configure a background task queue, failed webhooks will not be retried.
 

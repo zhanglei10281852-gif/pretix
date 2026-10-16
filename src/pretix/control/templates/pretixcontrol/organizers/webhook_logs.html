@@ -26,13 +26,73 @@
                     </button>
                 </p>
                 <p class="help-block">
-                    {% blocktranslate trimmed with minutes=5 %}
-                        Webhooks scheduled to be retried in less than {{ minutes }} minutes may not be listed here and can
-                        no longer be stopped or expedited.
-                    {% endblocktranslate %}
+                    {% blocktrans trimmed %}
+                        Requests that are currently being transmitted to the target endpoint cannot be stopped;
+                        their result will still be logged below.
+                    {% endblocktrans %}
                 </p>
             </div>
         </form>
+    {% endif %}
+    {% if pending_deliveries or terminated_deliveries %}
+        <h2>{% trans "Delivery status" %}</h2>
+        <p>
+            {% trans "Every notification has a stable delivery identity. Its target address, event type and request body are frozen when the notification is first queued and never change, even if the webhook configuration or the related business objects change afterwards." %}
+        </p>
+        <table class="table table-condensed table-hover">
+            <thead>
+            <tr>
+                <th>#</th>
+                <th>{% trans "Event type" %}</th>
+                <th>{% trans "Frozen target" %}</th>
+                <th>{% trans "Attempts" %}</th>
+                <th>{% trans "Next attempt" %}</th>
+                <th>{% trans "Status" %}</th>
+            </tr>
+            </thead>
+            <tbody>
+            {% for d in pending_deliveries %}
+                <tr>
+                    <td>{{ d.pk }}</td>
+                    <td>{{ d.action_type }}</td>
+                    <td>{{ d.target_url }}</td>
+                    <td>{{ d.retry_count }}</td>
+                    <td>
+                        {% if d.state == "running" %}
+                            <em>{% trans "in progress" %}</em>
+                        {% else %}
+                            {{ d.retry_not_before|date:"SHORT_DATETIME_FORMAT" }}
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if d.state == "running" %}
+                            <span class="label label-primary">{% trans "Attempt in progress" %}</span>
+                        {% else %}
+                            <span class="label label-warning">{% trans "Waiting" %}</span>
+                        {% endif %}
+                    </td>
+                </tr>
+            {% endfor %}
+            {% for d in terminated_deliveries %}
+                <tr>
+                    <td>{{ d.pk }}</td>
+                    <td>{{ d.action_type }}</td>
+                    <td>{{ d.target_url }}</td>
+                    <td>{{ d.retry_count }}</td>
+                    <td></td>
+                    <td>
+                        {% if d.state == "given_up" %}
+                            <span class="label label-danger">{% trans "Given up" %}</span>
+                        {% elif d.state == "disabled" %}
+                            <span class="label label-default">{% trans "Terminated (endpoint disabled)" %}</span>
+                        {% elif d.state == "success" %}
+                            <span class="label label-success">{% trans "Successfully delivered" %}</span>
+                        {% endif %}
+                    </td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
     {% endif %}
     {% for c in calls %}
         <details class="panel panel-default">

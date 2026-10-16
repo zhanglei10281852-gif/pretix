@@ -25,7 +25,7 @@ from django.dispatch import receiver
 from django.utils.timezone import now
 from django_scopes import scopes_disabled
 
-from pretix.api.models import ApiCall, WebHookCall
+from pretix.api.models import ApiCall, WebHookCall, WebHookDelivery
 from pretix.base.signals import EventPluginSignal, GlobalSignal, periodic_task
 from pretix.helpers.periodic import minimum_interval
 
@@ -70,7 +70,14 @@ from e.g. ``meta_info`` to the API consumer,
 @scopes_disabled()
 @minimum_interval(minutes_after_success=12 * 60)
 def cleanup_webhook_logs(sender, **kwargs):
-    WebHookCall.objects.filter(datetime__lte=now() - timedelta(days=30)).delete()
+    cutoff = now() - timedelta(days=30)
+    WebHookCall.objects.filter(datetime__lte=cutoff).delete()
+    # Only deliveries that have reached a final state may be cleaned up. Deliveries that are
+    # still waiting for a retry or have an attempt in progress keep their frozen snapshots even
+    # if they are older than the cutoff, since they are still required for delivery.
+    WebHookDelivery.objects.filter(updated__lte=cutoff).exclude(
+        state__in=(WebHookDelivery.STATE_WAITING, WebHookDelivery.STATE_RUNNING)
+    ).delete()
 
 
 @receiver(periodic_task)

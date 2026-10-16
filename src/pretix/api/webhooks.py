@@ -35,7 +35,7 @@ from django_scopes import scope, scopes_disabled
 from requests import RequestException
 
 from pretix.api.models import (
-    WebHook, WebHookCall, WebHookCallRetry, WebHookEventListener,
+    WebHook, WebHookCall, WebHookDelivery, WebHookEventListener,
 )
 from pretix.api.signals import register_webhook_events
 from pretix.base.models import LogEntry
@@ -486,6 +486,74 @@ def register_default_webhook_events(sender, **kwargs):
     )
 
 
+#: Retry intervals in seconds. Added up, these are approximately 3 days, as documented.
+RETRY_INTERVALS = (
+    5,  # + 5 seconds
+    30,  # + 30 seconds
+    60,  # + 1 minute
+    300,  # + 5 minutes
+    1200,  # + 20 minutes
+    3600,  # + 60 minutes
+    14400,  # + 4 hours
+    21600,  # + 6 hours
+    43200,  # + 12 hours
+    43200,  # + 24 hours
+    86400,  # + 24 hours
+)
+#: Intervals below this threshold are scheduled as celery tasks directly, everything above is
+#: persisted in the database and picked up by the periodic scan.
+RETRY_CELERY_CUTOFF = 300
+#: A waiting delivery that recently got a celery task published is not picked up again by scans
+#: until this grace period elapsed. Must be longer than any normal broker/queue delay.
+REPUBLISH_GRACE = timedelta(minutes=15)
+#: An attempt (HTTP timeout is 30 seconds) which has been in the running state longer than this
+#: is assumed to belong to a crashed worker or a lost task and may be reclaimed by another task
+#: or the periodic scan.
+STALE_ATTEMPT_TIMEOUT = timedelta(minutes=10)
+#: Maximum number of deliveries a single periodic scan publishes, to keep batches bounded.
+SCAN_BATCH_LIMIT = 500
+
+
+def _delivery_log(level, delivery, message, *args):
+    logger.log(
+        level,
+        "webhook delivery #%s (webhook=%s, event=%s, target=%s): " + message,
+        delivery.id, delivery.webhook_id, delivery.action_type, delivery.target_url, *args,
+        extra={
+            'webhook_delivery_id': delivery.id,
+            'webhook_id': delivery.webhook_id,
+            'webhook_target_url': delivery.target_url,
+            'webhook_action_type': delivery.action_type,
+        }
+    )
+
+
+def _publish_delivery_attempt(delivery_id: int, organizer_id: int, countdown: int = None) -> bool:
+    """
+    Publishes a celery task for a delivery. If publishing fails, the delivery stays in a
+    recoverable state and will be picked up by the next periodic scan.
+    """
+    kwargs = {
+        'args': (delivery_id,),
+        'priority': get_task_priority("notifications", organizer_id),
+    }
+    if countdown:
+        kwargs['countdown'] = countdown
+    try:
+        send_webhook.apply_async(**kwargs)
+    except Exception:
+        logger.exception(
+            "webhook delivery #%s: publishing the attempt task failed, leaving the delivery "
+            "in a recoverable state for the periodic scan",
+            delivery_id,
+        )
+        WebHookDelivery.objects.filter(
+            pk=delivery_id, state=WebHookDelivery.STATE_WAITING
+        ).update(scheduled_at=None)
+        return False
+    return True
+
+
 @app.task(base=TransactionAwareTask, max_retries=9, default_retry_delay=900, acks_late=True)
 def notify_webhooks(logentry_ids: list):
     if not isinstance(logentry_ids, list):
@@ -524,177 +592,345 @@ def notify_webhooks(logentry_ids: list):
                     Q(all_events=True) | Q(limit_events__pk=logentry.event_id)
                 )
 
-        for wh in webhooks:
-            send_webhook.apply_async(
-                args=(logentry.id, notification_type.action_type, wh.pk),
-                priority=get_task_priority("notifications", logentry.organizer_id),
+        # The payload is built once, when the notification is first queued, and the target URL
+        # and event type are frozen alongside it. Later changes to the business object, the
+        # webhook URL or the subscription scope never touch already-created deliveries.
+        with scope(organizer=logentry.organizer):
+            webhook_list = list(webhooks)
+            if not webhook_list:
+                continue
+            payload = notification_type.build_payload(logentry)
+            if payload is None:
+                # Content object deleted?
+                continue
+            payload_json = json.dumps(payload)
+
+            queued = []
+            for wh in webhook_list:
+                with transaction.atomic():
+                    delivery, created = WebHookDelivery.objects.get_or_create(
+                        webhook_id=wh.pk,
+                        logentry_id=logentry.id,
+                        defaults=dict(
+                            action_type=notification_type.action_type,
+                            target_url=wh.target_url,
+                            payload=payload_json,
+                            scheduled_at=now(),
+                        ),
+                    )
+                    if created:
+                        queued.append((delivery.id, wh.organizer_id))
+                        _delivery_log(
+                            logging.INFO, delivery,
+                            "queued for logentry #%s, frozen JSON snapshot with %s bytes",
+                            logentry.id, len(payload_json),
+                        )
+
+        for delivery_id, organizer_id in queued:
+            _publish_delivery_attempt(delivery_id, organizer_id)
+
+
+def _claim_delivery(delivery_id: int):
+    """
+    Claims a delivery for an attempt. Returns the delivery on success and ``None`` if the
+    delivery is already in a terminal state, if another worker currently holds an active
+    attempt, or if this row is locked by a concurrent scanner/worker.
+    """
+    d = WebHookDelivery.objects.select_related('webhook').select_for_update(
+        skip_locked=connection.features.has_select_for_update_skip_locked,
+        of=OF_SELF,
+    ).filter(pk=delivery_id).first()
+    if d is None:
+        logger.info(
+            "webhook delivery #%s: skipping attempt, the delivery is locked by another process",
+            delivery_id,
+        )
+        return None
+    if d.state in WebHookDelivery.TERMINAL_STATES:
+        _delivery_log(logging.INFO, d, "skipping attempt, delivery is already %s", d.state)
+        return None
+    if d.state == WebHookDelivery.STATE_RUNNING:
+        if d.locked_at and d.locked_at > now() - STALE_ATTEMPT_TIMEOUT:
+            _delivery_log(
+                logging.INFO, d,
+                "skipping duplicate task, an attempt is already active since %s",
+                d.locked_at,
             )
+            return None
+        _delivery_log(
+            logging.WARNING, d,
+            "reclaiming an attempt that has been running since %s, assuming the previous "
+            "worker died", d.locked_at,
+        )
+    d.state = WebHookDelivery.STATE_RUNNING
+    d.locked_at = now()
+    d.scheduled_at = None
+    d.save(update_fields=['state', 'locked_at', 'scheduled_at', 'updated'])
+    return d
 
 
-@app.task(base=ProfiledTask, bind=True, max_retries=5, default_retry_delay=60, acks_late=True, autoretry_for=(DatabaseError,),)
-def send_webhook(self, logentry_id: int, action_type: str, webhook_id: int, retry_count: int = 0):
+def _finish_delivery(delivery_id: int, return_code: int, response_body: str, execution_time: float) -> dict:
     """
-    Sends out a specific webhook using adequate retry and error handling logic.
-
-    Our retry logic is a little complex since we have different constraints here:
-
-    1. We historically documented that we retry for up to three days, so we want to keep that
-       promise. We want to use (approximately) exponentially increasing times to keep load
-       manageable.
-
-    2. We want to use Celery's ``acks_late=True`` options which prevents lost tasks if a worker
-       crashes.
-
-    3. A limitation of Celery's redis broker implementation is that it can not properly handle
-       tasks that *run or wait* longer than `visibility_timeout`, which defaults to 1h, when
-       ``acks_late`` is enabled. So any task with a *retry interval* of >1h will be restarted
-       many times because celery believes the worker has crashed.
-
-    4. We do like that the first few retries happen within a few seconds to work around very
-       intermittent connectivity issues quickly. For the longer retries with multiple hours,
-       we don't care if they are emitted a few minutes too late.
-
-    We therefore have a two-phase retry process:
-
-    - For all retry intervals below 5 minutes, which is the first 3 retries currently, we
-      schedule a new celery task directly with an increased retry_count. We do *not* use
-      celery's retry() call currently to make the retry process in both phases more similar,
-      there should not be much of a difference though (except that the initial task will be in
-      SUCCESS state, but we don't check that status anywhere).
-
-    - For all retry intervals of at least 5 minutes, we create a database entry. Then, the
-      periodic task ``schedule_webhook_retries_on_celery`` will schedule celery tasks for them
-      once their time has come.
+    Records the HTTP attempt in the call history and moves the delivery to its next state.
+    Runs while holding a row lock on the delivery, so concurrent retries, scans, worker
+    restarts and administrator actions cannot create two active copies or record more than
+    one final state.
     """
-    retry_intervals = (
-        5,  # + 5 seconds
-        30,  # + 30 seconds
-        60,  # + 1 minute
-        300,  # + 5 minutes
-        1200,  # + 20 minutes
-        3600,  # + 60 minutes
-        14400,  # + 4 hours
-        21600,  # + 6 hours
-        43200,  # + 12 hours
-        43200,  # + 24 hours
-        86400,  # + 24 hours
-    )  # added up, these are approximately 3 days, as documented
-    retry_celery_cutoff = 300
+    with transaction.atomic():
+        d = WebHookDelivery.objects.select_related('webhook').select_for_update(
+            skip_locked=connection.features.has_select_for_update_skip_locked,
+            of=OF_SELF,
+        ).get(pk=delivery_id)
 
+        attempt = d.retry_count + 1
+        success = 200 <= return_code <= 299
+        WebHookCall.objects.create(
+            webhook_id=d.webhook_id,
+            delivery=d,
+            action_type=d.action_type,
+            target_url=d.target_url,
+            is_retry=d.retry_count > 0,
+            execution_time=execution_time,
+            return_code=return_code,
+            payload=d.payload,
+            response_body=response_body[:1024 * 1024],
+            success=success,
+        )
+
+        # The delivery may have been terminated (endpoint disabled or given up manually) while
+        # the HTTP request was in flight. Record the attempt, but never resurrect it.
+        if d.state != WebHookDelivery.STATE_RUNNING:
+            _delivery_log(
+                logging.INFO, d,
+                "attempt #%s returned HTTP %s after %.2fs, but the delivery had already been "
+                "terminated as %s", attempt, return_code, execution_time, d.state,
+            )
+            return {'state': d.state}
+
+        d.locked_at = None
+        if success:
+            d.state = WebHookDelivery.STATE_SUCCESS
+            d.save(update_fields=['state', 'locked_at', 'updated'])
+            _delivery_log(
+                logging.INFO, d,
+                "attempt #%s succeeded with HTTP %s after %.2fs, delivery finished: success",
+                attempt, return_code, execution_time,
+            )
+            return {'state': WebHookDelivery.STATE_SUCCESS}
+
+        if return_code == 410:
+            d.state = WebHookDelivery.STATE_DISABLED
+            d.save(update_fields=['state', 'locked_at', 'updated'])
+            # This also terminates all other still-pending deliveries of this webhook.
+            webhook = d.webhook
+            webhook.enabled = False
+            webhook.save(update_fields=['enabled'])
+            _delivery_log(
+                logging.WARNING, d,
+                "attempt #%s got HTTP 410 after %.2fs, webhook disabled, delivery finished: "
+                "terminated (endpoint disabled)", attempt, execution_time,
+            )
+            return {'state': WebHookDelivery.STATE_DISABLED}
+
+        if d.retry_count >= len(RETRY_INTERVALS):
+            d.state = WebHookDelivery.STATE_GIVEN_UP
+            d.save(update_fields=['state', 'locked_at', 'updated'])
+            _delivery_log(
+                logging.WARNING, d,
+                "attempt #%s failed with HTTP %s after %.2fs, retry schedule exhausted, "
+                "delivery finished: given up", attempt, return_code, execution_time,
+            )
+            return {'state': WebHookDelivery.STATE_GIVEN_UP}
+
+        interval = RETRY_INTERVALS[d.retry_count]
+        next_not_before = now() + timedelta(seconds=interval)
+        d.retry_count += 1
+        d.state = WebHookDelivery.STATE_WAITING
+        d.retry_not_before = next_not_before
+        if interval < RETRY_CELERY_CUTOFF:
+            # Publish a celery task directly; mark the delivery as scheduled so a concurrent
+            # scan does not publish a second task.
+            d.scheduled_at = now()
+            via_celery = True
+        else:
+            # Persist the delayed retry and let the periodic scan publish when it is due.
+            d.scheduled_at = None
+            via_celery = False
+        d.save(update_fields=['state', 'retry_count', 'retry_not_before', 'locked_at',
+                              'scheduled_at', 'updated'])
+        _delivery_log(
+            logging.INFO, d,
+            "attempt #%s failed with HTTP %s after %.2fs, waiting until %s for attempt #%s "
+            "(%s)",
+            attempt, return_code, execution_time, next_not_before, d.retry_count + 1,
+            'celery' if via_celery else 'database',
+        )
+        return {
+            'state': WebHookDelivery.STATE_WAITING,
+            'via_celery': via_celery,
+            'interval': interval,
+        }
+
+
+@app.task(base=ProfiledTask, bind=True, max_retries=5, default_retry_delay=60, acks_late=True,
+          autoretry_for=(DatabaseError,),)
+def send_webhook(self, delivery_id: int):
+    """
+    Performs one attempt of a previously queued webhook delivery.
+
+    A :class:`WebHookDelivery` row is the single source of truth for a delivery: its target
+    URL, event type and JSON request body are frozen when the notification is first queued and
+    never change afterwards, even if the webhook configuration or the related business objects
+    change.
+
+    Retry and crash semantics:
+
+    1. We retry for up to three days with approximately exponentially increasing intervals,
+       see ``RETRY_INTERVALS``.
+
+    2. ``acks_late=True`` prevents completely lost tasks when a worker crashes. Any duplicate
+       task (worker redelivery, overlapping periodic scans, concurrent administrator actions)
+       converges through a row-level claim: only one attempt can be active at a time, and a
+       delivery already in a terminal state is never executed again.
+
+    3. Because celery/redis can not properly handle long-running ``acks_late`` tasks beyond
+       ``visibility_timeout``, delays of 5 minutes and more are persisted on the delivery row
+       and published by the periodic scan; shorter delays are celery tasks. The periodic scan
+       also reclaims deliveries left in the running state by a crashed worker, as well as
+       waiting deliveries whose celery task could never be published.
+    """
     with scopes_disabled():
-        webhook = WebHook.objects.get(id=webhook_id)
+        delivery = WebHookDelivery.objects.select_related('webhook').get(pk=delivery_id)
 
-    with scope(organizer=webhook.organizer), transaction.atomic():
-        logentry = LogEntry.all.get(id=logentry_id)
-        types = get_all_webhook_events()
-        event_type = types.get(action_type)
-        if not event_type or not webhook.enabled:
-            return 'obsolete-webhook'  # Ignore, e.g. plugin not installed
+    with scope(organizer=delivery.webhook.organizer):
+        with transaction.atomic():
+            d = _claim_delivery(delivery_id)
+        if d is None:
+            return 'obsolete'
 
-        payload = event_type.build_payload(logentry)
-        if payload is None:
-            # Content object deleted?
-            return 'obsolete-payload'
+        if not d.webhook.enabled:
+            # Safety net, disabling a webhook normally already terminates all pending
+            # deliveries via WebHook.save().
+            with transaction.atomic():
+                WebHookDelivery.objects.filter(
+                    pk=delivery_id, state__in=WebHookDelivery.ACTIVE_STATES
+                ).update(state=WebHookDelivery.STATE_DISABLED, scheduled_at=None, locked_at=None)
+            _delivery_log(logging.INFO, d, "webhook is disabled, delivery finished: terminated")
+            return 'gone'
+
+        _delivery_log(logging.INFO, d, "attempt #%s started, sending frozen JSON snapshot",
+                      d.retry_count + 1)
 
         t = time.time()
-
         try:
             resp = requests.post(
-                webhook.target_url,
-                json=payload,
+                d.target_url,
+                data=d.payload.encode('utf-8'),
+                headers={'Content-Type': 'application/json'},
                 allow_redirects=False,
                 timeout=30,
             )
-            WebHookCall.objects.create(
-                webhook=webhook,
-                action_type=logentry.action_type,
-                target_url=webhook.target_url,
-                is_retry=self.request.retries > 0,
-                execution_time=time.time() - t,
-                return_code=resp.status_code,
-                payload=json.dumps(payload),
-                response_body=resp.text[:1024 * 1024],
-                success=200 <= resp.status_code <= 299
-            )
-            if resp.status_code == 410:
-                webhook.enabled = False
-                webhook.save()
-                return 'gone'
-            elif resp.status_code > 299:
-                if retry_count >= len(retry_intervals):
-                    return 'retry-given-up'
-                elif retry_intervals[retry_count] < retry_celery_cutoff:
-                    send_webhook.apply_async(
-                        args=(logentry_id, action_type, webhook_id, retry_count + 1),
-                        countdown=retry_intervals[retry_count]
-                    )
-                    return 'retry-via-celery'
-                else:
-                    webhook.retries.update_or_create(
-                        logentry=logentry,
-                        defaults=dict(
-                            retry_not_before=now() + timedelta(seconds=retry_intervals[retry_count]),
-                            retry_count=retry_count + 1,
-                            action_type=action_type,
-                        ),
-                    )
-                    return 'retry-via-db'
-            return 'ok'
         except RequestException as e:
-            WebHookCall.objects.create(
-                webhook=webhook,
-                action_type=logentry.action_type,
-                target_url=webhook.target_url,
-                is_retry=self.request.retries > 0,
-                execution_time=time.time() - t,
-                return_code=0,
-                payload=json.dumps(payload),
-                response_body=str(e)[:1024 * 1024]
+            execution_time = time.time() - t
+            _delivery_log(
+                logging.WARNING, d,
+                "attempt #%s failed with a network error after %.2fs: %s",
+                d.retry_count + 1, execution_time, str(e),
             )
-            if retry_count >= len(retry_intervals):
-                return 'retry-given-up'
-            elif retry_intervals[retry_count] < retry_celery_cutoff:
-                send_webhook.apply_async(
-                    args=(logentry_id, action_type, webhook_id, retry_count + 1),
-                    countdown=retry_intervals[retry_count]
-                )
-                return 'retry-via-celery'
-            else:
-                webhook.retries.update_or_create(
-                    logentry=logentry,
-                    defaults=dict(
-                        retry_not_before=now() + timedelta(seconds=retry_intervals[retry_count]),
-                        retry_count=retry_count + 1,
-                        action_type=action_type,
-                    ),
-                )
-                return 'retry-via-db'
+            result = _finish_delivery(delivery_id, 0, str(e), execution_time)
+        else:
+            execution_time = time.time() - t
+            result = _finish_delivery(delivery_id, resp.status_code, resp.text, execution_time)
+
+        if result.get('state') == WebHookDelivery.STATE_WAITING and result.get('via_celery'):
+            _publish_delivery_attempt(delivery_id, d.webhook.organizer_id,
+                                      countdown=result['interval'])
+
+        return result['state']
+
+
+def _mark_waiting_for_publish(queryset, set_due_now=False):
+    """
+    Locks waiting deliveries and marks them as scheduled so a concurrent scan or administrator
+    action can not publish a second task for them. Returns ``(delivery_id, organizer_id)``
+    tuples for which a task must be published after the transaction committed.
+    """
+    t = now()
+    due = []
+    with transaction.atomic():
+        for d in queryset.select_related('webhook').select_for_update(
+            skip_locked=connection.features.has_select_for_update_skip_locked,
+            of=OF_SELF,
+        ):
+            d.scheduled_at = t
+            update_fields = ['scheduled_at', 'updated']
+            if set_due_now:
+                d.retry_not_before = t
+                update_fields.append('retry_not_before')
+            d.save(update_fields=update_fields)
+            due.append((d.id, d.webhook.organizer_id))
+    return due
 
 
 @app.task(base=TransactionAwareTask)
 def manually_retry_all_calls(webhook_id: int):
     with scopes_disabled():
         webhook = WebHook.objects.get(id=webhook_id)
-    with scope(organizer=webhook.organizer), transaction.atomic():
-        for whcr in webhook.retries.select_for_update(
-            skip_locked=connection.features.has_select_for_update_skip_locked,
-            of=OF_SELF
-        ):
-            send_webhook.apply_async(
-                args=(whcr.logentry_id, whcr.action_type, whcr.webhook_id, whcr.retry_count),
-            )
-            whcr.delete()
+    with scope(organizer=webhook.organizer):
+        # Only waiting deliveries are affected; deliveries currently being attempted keep their
+        # active attempt and end up waiting again if that attempt fails. All of these continue
+        # the same frozen delivery, they are not turned into new requests.
+        due = _mark_waiting_for_publish(
+            webhook.deliveries.filter(state=WebHookDelivery.STATE_WAITING),
+            set_due_now=True,
+        )
+        logger.info(
+            "webhook #%s: administrator requested immediate retry of %s waiting deliveries",
+            webhook_id, len(due),
+        )
+    for delivery_id, organizer_id in due:
+        _publish_delivery_attempt(delivery_id, organizer_id)
 
 
 @receiver(signal=periodic_task, dispatch_uid='pretixapi_schedule_webhook_retries_on_celery')
 @scopes_disabled()
 def schedule_webhook_retries_on_celery(sender, **kwargs):
+    t = now()
+    stale_cutoff = t - STALE_ATTEMPT_TIMEOUT
+    republish_cutoff = t - REPUBLISH_GRACE
+
+    # Pick up waiting deliveries that are due and either never got a task published or lost it
+    # longer ago than the republish grace, as well as deliveries stuck in the running state
+    # because a worker died mid-attempt (or the task was lost entirely).
+    waiting_due = Q(
+        state=WebHookDelivery.STATE_WAITING,
+        retry_not_before__lte=t,
+    ) & (
+        Q(scheduled_at__isnull=True) | Q(scheduled_at__lte=republish_cutoff)
+    )
+    stale_running = Q(
+        state=WebHookDelivery.STATE_RUNNING,
+        locked_at__lte=stale_cutoff,
+    )
+    queryset = WebHookDelivery.objects.filter(waiting_due | stale_running)
+
+    due = []
     with transaction.atomic():
-        for whcr in WebHookCallRetry.objects.select_for_update(
-            skip_locked=connection.features.has_select_for_update_skip_locked,
-            of=OF_SELF
-        ).filter(retry_not_before__lt=now()):
-            send_webhook.apply_async(
-                args=(whcr.logentry_id, whcr.action_type, whcr.webhook_id, whcr.retry_count),
-            )
-            whcr.delete()
+        deliveries = list(
+            queryset.select_related('webhook').select_for_update(
+                skip_locked=connection.features.has_select_for_update_skip_locked,
+                of=OF_SELF,
+            )[:SCAN_BATCH_LIMIT]
+        )
+        for d in deliveries:
+            if d.state == WebHookDelivery.STATE_WAITING:
+                d.scheduled_at = t
+                d.save(update_fields=['scheduled_at', 'updated'])
+            # Stale running deliveries are not modified: the published task will either claim
+            # the stale attempt or back off if another task got there first.
+            due.append((d.id, d.webhook.organizer_id))
+
+    if due:
+        logger.info("webhook periodic scan: publishing %s due/stale delivery attempts", len(due))
+    for delivery_id, organizer_id in due:
+        _publish_delivery_attempt(delivery_id, organizer_id)

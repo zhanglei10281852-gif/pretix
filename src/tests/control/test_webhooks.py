@@ -19,12 +19,17 @@
 # You should have received a copy of the GNU Affero General Public License along with this program.  If not, see
 # <https://www.gnu.org/licenses/>.
 #
+import json
+from datetime import timedelta
+from decimal import Decimal
+
 import pytest
+import responses
 from django.utils.timezone import now
 from django_scopes import scopes_disabled
 
-from pretix.api.models import WebHook
-from pretix.base.models import Event, Organizer, Team, User
+from pretix.api.models import WebHook, WebHookDelivery
+from pretix.base.models import Event, Item, Order, OrderPosition, Organizer, Team, User
 
 
 @pytest.fixture
@@ -123,3 +128,109 @@ def test_webhook_logs(event, admin_user, admin_team, webhook, client):
     )
     resp = client.get('/control/organizer/dummy/webhook/{}/logs'.format(webhook.pk))
     assert 'pretix.event.order.paid' in resp.content.decode()
+
+
+@pytest.mark.django_db
+def test_webhook_logs_show_delivery_states(event, admin_user, admin_team, webhook, order, client):
+    client.login(email='dummy@dummy.dummy', password='dummy')
+    with scopes_disabled():
+        waiting = _waiting_delivery(webhook, order)
+        WebHookDelivery.objects.filter(pk=waiting.pk).update(
+            state=WebHookDelivery.STATE_GIVEN_UP
+        )
+        resp = client.get('/control/organizer/dummy/webhook/{}/logs'.format(webhook.pk))
+        body = resp.content.decode()
+        assert 'Given up' in body
+        assert webhook.target_url in body
+        assert 'pretix.event.order.paid' in body
+
+
+@pytest.fixture
+def order(event):
+    o = Order.objects.create(
+        code='FOO', event=event, email='dummy@dummy.test',
+        status=Order.STATUS_PENDING, locale='en',
+        datetime=now(), expires=now() + timedelta(days=10),
+        sales_channel=event.organizer.sales_channels.get(identifier="web"),
+        total=Decimal('46.00'),
+    )
+    ticket = Item.objects.create(event=event, name='Early-bird ticket',
+                                 default_price=Decimal('23.00'), admission=True)
+    OrderPosition.objects.create(
+        order=o, item=ticket, variation=None,
+        price=Decimal("23.00"), attendee_name_parts={'full_name': "Peter"}, positionid=1
+    )
+    return o
+
+
+def _waiting_delivery(webhook, order):
+    le = order.log_action('pretix.event.order.paid', {}, save=False)
+    le.save()
+    return WebHookDelivery.objects.create(
+        webhook=webhook,
+        logentry=le,
+        action_type='pretix.event.order.paid',
+        target_url=webhook.target_url,
+        payload=json.dumps({
+            'notification_id': le.pk,
+            'organizer': 'dummy',
+            'event': 'dummy',
+            'code': 'FOO',
+            'action': 'pretix.event.order.paid',
+        }),
+        state=WebHookDelivery.STATE_WAITING,
+        retry_not_before=now(),
+    )
+
+
+@pytest.mark.django_db
+def test_webhook_drop_terminates_pending_deliveries(event, admin_user, admin_team, webhook, order, client):
+    client.login(email='dummy@dummy.dummy', password='dummy')
+    with scopes_disabled():
+        d = _waiting_delivery(webhook, order)
+        resp = client.post('/control/organizer/dummy/webhook/{}/logs'.format(webhook.pk), {
+            'action': 'drop',
+        })
+        assert resp.status_code == 302
+        d.refresh_from_db()
+        assert d.state == WebHookDelivery.STATE_GIVEN_UP
+        # The snapshot is retained, only the state changed.
+        assert d.target_url == webhook.target_url
+        assert json.loads(d.payload)['code'] == 'FOO'
+
+
+@pytest.mark.django_db
+@responses.activate
+def test_webhook_expedite_retries_same_delivery(event, admin_user, admin_team, webhook,
+                                                order, client,
+                                                django_capture_on_commit_callbacks):
+    client.login(email='dummy@dummy.dummy', password='dummy')
+    responses.add(responses.POST, 'https://google.com', status=200)
+    with scopes_disabled():
+        d = _waiting_delivery(webhook, order)
+        with django_capture_on_commit_callbacks(execute=True):
+            resp = client.post('/control/organizer/dummy/webhook/{}/logs'.format(webhook.pk), {
+                'action': 'expedite',
+            })
+        assert resp.status_code == 302
+        d.refresh_from_db()
+        assert d.state == WebHookDelivery.STATE_SUCCESS
+        assert WebHookDelivery.objects.count() == 1
+        assert len(responses.calls) == 1
+        assert d.calls.count() == 1
+
+
+@pytest.mark.django_db
+def test_webhook_disable_terminates_pending_deliveries(event, admin_user, admin_team, webhook,
+                                                       order, client):
+    client.login(email='dummy@dummy.dummy', password='dummy')
+    with scopes_disabled():
+        d = _waiting_delivery(webhook, order)
+        resp = client.post('/control/organizer/dummy/webhook/{}/edit'.format(webhook.pk), {
+            'target_url': 'https://google.com',
+            'events': ['pretix.event.order.paid', 'pretix.event.order.placed'],
+            'limit_events': str(event.pk),
+        }, follow=True)
+        assert resp.status_code == 200
+        d.refresh_from_db()
+        assert d.state == WebHookDelivery.STATE_DISABLED

@@ -77,7 +77,7 @@ from django.views.generic import (
 )
 from django.views.generic.detail import SingleObjectMixin
 
-from pretix.api.models import ApiCall, WebHook
+from pretix.api.models import ApiCall, WebHook, WebHookDelivery
 from pretix.api.webhooks import manually_retry_all_calls
 from pretix.base.auth import get_auth_backends
 from pretix.base.channels import get_all_sales_channel_types
@@ -1611,7 +1611,16 @@ class WebHookLogsView(OrganizerDetailViewMixin, OrganizerPermissionRequiredMixin
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
         ctx['webhook'] = self.webhook
-        ctx['retry_count'] = self.webhook.retries.count()
+        ctx['retry_count'] = self.webhook.deliveries.filter(
+            state=WebHookDelivery.STATE_WAITING
+        ).count()
+        ctx['pending_deliveries'] = self.webhook.deliveries.filter(
+            state__in=(WebHookDelivery.STATE_WAITING, WebHookDelivery.STATE_RUNNING)
+        ).order_by('retry_not_before')[:50]
+        ctx['terminated_deliveries'] = self.webhook.deliveries.filter(
+            state__in=(WebHookDelivery.STATE_GIVEN_UP, WebHookDelivery.STATE_DISABLED),
+            updated__gte=now() - timedelta(days=30),
+        ).order_by('-updated')[:20]
         return ctx
 
     @cached_property
@@ -1635,7 +1644,15 @@ class WebHookLogsView(OrganizerDetailViewMixin, OrganizerPermissionRequiredMixin
             self.request.organizer.log_action('pretix.webhook.retries.dropped', user=self.request.user, data={
                 'webhook': self.webhook.pk,
             })
-            self.webhook.retries.all().delete()
+            # Explicitly terminate all pending deliveries instead of just deleting queue rows:
+            # each delivery keeps its frozen snapshot and a clear final state.
+            self.webhook.deliveries.filter(
+                state__in=(WebHookDelivery.STATE_WAITING, WebHookDelivery.STATE_RUNNING)
+            ).update(
+                state=WebHookDelivery.STATE_GIVEN_UP,
+                scheduled_at=None,
+                locked_at=None,
+            )
             messages.success(request, _('All unprocessed webhooks have been stopped from retrying.'))
         return redirect(reverse('control:organizer.webhook.logs', kwargs={
             'organizer': self.request.organizer.slug,
