@@ -325,6 +325,7 @@ TEST_SCHEDULED_EXPORT_RES = {
     "schedule_rrule": "DTSTART:20230118T000000\nRRULE:FREQ=WEEKLY;BYDAY=TU,WE,TH",
     "schedule_rrule_time": "04:00:00",
     "error_counter": 0,
+    "last_execution": None,
 }
 
 

@@ -52,6 +52,28 @@
                                 <span class="fa fa-fw fa-envelope-o"></span>
                                 {{ s.mail_subject }}
                             </span>
+                            {% if s.recent_executions %}
+                                <div class="schedule-executions">
+                                    {% for e in s.recent_executions %}
+                                        <span class="label
+                                            {% if e.status == 'completed' %}label-success
+                                            {% elif e.status == 'failed' %}{% if e.soft_failed %}label-warning{% else %}label-danger{% endif %}
+                                            {% elif e.status == 'rendering' %}label-primary
+                                            {% elif e.status == 'file_ready' or e.status == 'mail_queued' %}label-info
+                                            {% else %}label-default{% endif %}"
+                                              title="{{ e.error_message|default_if_none:"" }}">
+                                            {% if e.manual %}
+                                                <span class="fa fa-user fa-fw" title="{% trans "Manual run" %}"></span>
+                                            {% endif %}
+                                            {{ e.get_status_display }}
+                                        </span>
+                                        <span class="text-muted">
+                                            {{ e.scheduled_for|default_if_none:e.started|default_if_none:e.created|date:"SHORT_DATETIME_FORMAT" }}
+                                        </span>
+                                        {% if not forloop.last %}&middot;{% endif %}
+                                    {% endfor %}
+                                </div>
+                            {% endif %}
                         </div>
                         <div class="col-lg-3 col-md-3 col-xs-12 text-right">
                             <form action="{% url "control:event.orders.export.do" event=request.event.slug organizer=request.organizer.slug %}"

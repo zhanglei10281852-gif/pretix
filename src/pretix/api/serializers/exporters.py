@@ -165,10 +165,31 @@ class ScheduledExportSerializer(serializers.ModelSerializer):
     owner = serializers.SlugRelatedField(slug_field='email', read_only=True)
     error_counter = serializers.IntegerField(read_only=True)
     export_form_data = ExportFormDataField()
+    last_execution = serializers.SerializerMethodField()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.fields['export_identifier'].choices = [(e, e) for e in self.context['exporters']]
+
+    def get_last_execution(self, instance):
+        recent = getattr(instance, 'recent_executions', None)
+        if recent is None:
+            recent = list(instance.executions.order_by('-created')[:1])
+        execution = recent[0] if recent else None
+        if execution is None:
+            return None
+        return {
+            'id': execution.pk,
+            'status': execution.status,
+            'manual': execution.manual,
+            'scheduled_for': execution.scheduled_for,
+            'error_code': execution.error_code,
+            'error_message': execution.error_message,
+            'soft_failed': execution.soft_failed,
+            'created': execution.created,
+            'started': execution.started,
+            'finished': execution.finished,
+        }
 
     def validate_mail_additional_recipients(self, value):
         d = value.replace(' ', '')
@@ -208,6 +229,7 @@ class ScheduledEventExportSerializer(ScheduledExportSerializer):
             'schedule_rrule_time',
             'schedule_next_run',
             'error_counter',
+            'last_execution',
         ]
 
 
@@ -232,4 +254,5 @@ class ScheduledOrganizerExportSerializer(ScheduledExportSerializer):
             'schedule_next_run',
             'timezone',
             'error_counter',
+            'last_execution',
         ]

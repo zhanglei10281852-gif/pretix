@@ -81,7 +81,8 @@ from pretix.base.i18n import language
 from pretix.base.models import (
     CachedFile, CachedTicket, Checkin, GiftCard, Invoice, InvoiceAddress, Item,
     ItemVariation, LogEntry, Order, QuestionAnswer, Quota,
-    ScheduledEventExport, SeatCategoryMapping, generate_secret,
+    ScheduledEventExport, ScheduledEventExportExecution, SeatCategoryMapping,
+    generate_secret,
 )
 from pretix.base.models.orders import (
     CancellationRequest, OrderFee, OrderPayment, OrderPosition, OrderRefund,
@@ -93,7 +94,8 @@ from pretix.base.secrets import assign_ticket_secret
 from pretix.base.services import tickets
 from pretix.base.services.cancelevent import cancel_event
 from pretix.base.services.export import (
-    export, init_event_exporters, scheduled_event_export,
+    create_manual_execution, dispatch_scheduled_export_task, export,
+    init_event_exporters, scheduled_event_export,
 )
 from pretix.base.services.invoices import (
     generate_cancellation, generate_invoice, invoice_pdf, invoice_pdf_task,
@@ -2760,7 +2762,13 @@ class ExportMixin:
             qs = self.request.event.scheduled_exports.filter(owner=self.request.user)
         else:
             qs = self.request.event.scheduled_exports
-        return qs.select_related('owner').order_by('export_identifier', 'schedule_next_run')
+        return qs.select_related('owner').prefetch_related(
+            Prefetch(
+                'executions',
+                queryset=ScheduledEventExportExecution.objects.order_by('-created')[:5],
+                to_attr='recent_executions',
+            )
+        ).order_by('export_identifier', 'schedule_next_run')
 
     @cached_property
     def scheduled(self):
@@ -3029,15 +3037,21 @@ class RunScheduledExportView(EventPermissionRequiredMixin, ExportMixin, View):
 
     def post(self, request, *args, **kwargs):
         s = get_object_or_404(self.get_scheduled_queryset(), pk=kwargs.get('pk'))
-        scheduled_event_export.apply_async(
-            kwargs={
-                'event': s.event_id,
-                'schedule': s.pk,
-            },
-            # Scheduled exports usually run on the low-prio queue "background" but if they're manually triggered,
-            # we run them with normal priority
-            queue='default',
-        )
+        with transaction.atomic():
+            # A manual run is its own execution and never occupies or duplicates
+            # a pending scheduled slot.
+            execution = create_manual_execution(ScheduledEventExportExecution, s)
+            dispatch_scheduled_export_task(
+                scheduled_event_export,
+                {
+                    'event': s.event_id,
+                    'schedule': s.pk,
+                    'execution': execution.pk,
+                },
+                # Scheduled exports usually run on the low-prio queue "background" but if they're manually
+                # triggered, we run them with normal priority
+                queue='default',
+            )
         messages.success(self.request, _('Your export is queued to start soon. The results will be send via email. '
                                          'Depending on system load and type and size of export, this may take a few '
                                          'minutes.'))

@@ -31,7 +31,10 @@ from django_scopes import scopes_disabled
 from pretix.base.models import CachedCombinedTicket, CachedTicket, OutgoingMail
 from pretix.base.models.customers import CustomerSSOGrant
 
-from ..models import CachedFile, CartPosition, InvoiceAddress
+from ..models import (
+    CachedFile, CartPosition, InvoiceAddress, ScheduledEventExportExecution,
+    ScheduledOrganizerExportExecution,
+)
 from ..models.auth import UserKnownLoginSource
 from ..models.orders import CheckoutSession
 from ..signals import periodic_task
@@ -66,7 +69,26 @@ def clean_cached_files(sender, **kwargs):
             ),
         )
     )
-    for cf in CachedFile.objects.filter(expires__isnull=False, expires__lt=now()).exclude(has_queued_email):
+    # Files belonging to an execution that has not reached a terminal state must be
+    # kept so that the execution can still recover. Terminal executions fall back to
+    # the usual email/CachedFile retention rules.
+    execution_models = (
+        ('has_active_event_export_execution', ScheduledEventExportExecution),
+        ('has_active_organizer_export_execution', ScheduledOrganizerExportExecution),
+    )
+    qs = CachedFile.objects.filter(expires__isnull=False, expires__lt=now()).exclude(has_queued_email)
+    for annotation_name, execution_model in execution_models:
+        has_active_execution = Exists(
+            execution_model.objects.filter(
+                file=OuterRef("pk"),
+            ).exclude(
+                status__in=tuple(execution_model.STATUS_LIST_TERMINAL),
+            )
+        )
+        qs = qs.annotate(**{annotation_name: has_active_execution}).exclude(
+            **{annotation_name: True}
+        )
+    for cf in qs:
         cf.delete()
 
 

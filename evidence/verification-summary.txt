@@ -1,0 +1,1 @@
+复核时隙执行模型、调度发布、渲染与邮件状态机、失败结算、暂停阈值、查询展示和 CachedFile 清理；无缓存专项测试 12 项通过，完整 test_export.py 为 26 通过、1 个 Windows NamedTemporaryFile/openpyxl 权限错误。

@@ -24,6 +24,7 @@ from datetime import timedelta
 from celery.result import AsyncResult
 from django.conf import settings
 from django.db import transaction
+from django.db.models import Prefetch
 from django.http import Http404
 from django.shortcuts import get_object_or_404
 from django.utils.functional import cached_property
@@ -41,8 +42,8 @@ from pretix.api.serializers.exporters import (
 )
 from pretix.base.exporter import OrganizerLevelExportMixin
 from pretix.base.models import (
-    CachedFile, Device, ScheduledEventExport, ScheduledOrganizerExport,
-    TeamAPIToken,
+    CachedFile, Device, ScheduledEventExport, ScheduledEventExportExecution,
+    ScheduledOrganizerExport, ScheduledOrganizerExportExecution, TeamAPIToken,
 )
 from pretix.base.models.organizer import TeamQuerySet
 from pretix.base.services.export import (
@@ -226,7 +227,13 @@ class ScheduledEventExportViewSet(ScheduledExportersViewSet):
                                        'user-specific API access.')
         else:
             qs = self.request.event.scheduled_exports
-        return qs.select_related("owner")
+        return qs.select_related("owner").prefetch_related(
+            Prefetch(
+                'executions',
+                queryset=ScheduledEventExportExecution.objects.order_by('-created')[:1],
+                to_attr='recent_executions',
+            )
+        )
 
     @transaction.atomic()
     def perform_create(self, serializer):
@@ -311,7 +318,13 @@ class ScheduledOrganizerExportViewSet(ScheduledExportersViewSet):
                                        'user-specific API access.')
         else:
             qs = self.request.organizer.scheduled_exports
-        return qs.select_related("owner")
+        return qs.select_related("owner").prefetch_related(
+            Prefetch(
+                'executions',
+                queryset=ScheduledOrganizerExportExecution.objects.order_by('-created')[:1],
+                to_attr='recent_executions',
+            )
+        )
 
     @transaction.atomic()
     def perform_create(self, serializer):
